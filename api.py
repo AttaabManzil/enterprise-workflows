@@ -46,7 +46,7 @@ class CreateWorkflowRequest(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
-    decision: str            # "approved" | "rejected"
+    decision: str  # "approved" | "rejected"
     reviewer: str
     notes: Optional[str] = None
 
@@ -71,11 +71,7 @@ class WorkflowEventResponse(BaseModel):
 # Event Logger
 # -------------------------------------------------------------------
 
-def log_event(
-    workflow_id: str,
-    event_type: str,
-    event_data: dict | None = None
-):
+def log_event(workflow_id: str, event_type: str, event_data: dict | None = None):
     with psycopg.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -189,11 +185,7 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
 
             if approval.decision == "rejected":
 
-                log_event(
-                    workflow_id,
-                    "ACTION_REJECTED",
-                    human_decision
-                )
+                log_event(workflow_id, "ACTION_REJECTED", human_decision)
 
                 cur.execute(
                     """
@@ -228,12 +220,38 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
                 }
             )
 
-            # Execute real-world side effect (idempotent)
-            execute_action(
-                action=recommended_action,
-                workflow_id=workflow_id,
-                request_text=request_text
-            )
+            # -------- EXECUTE REAL-WORLD ACTION SAFELY --------
+
+            try:
+                execute_action(
+                    action=recommended_action,
+                    workflow_id=workflow_id,
+                    request_text=request_text
+                )
+            except Exception as e:
+                log_event(
+                    workflow_id,
+                    "ACTION_FAILED",
+                    {"error": str(e)}
+                )
+
+                cur.execute(
+                    """
+                    UPDATE workflows
+                    SET state = 'ACTION_FAILED',
+                        updated_at = NOW()
+                    WHERE id = %s;
+                    """,
+                    (workflow_id,)
+                )
+                conn.commit()
+
+                raise HTTPException(
+                    status_code=500,
+                    detail="Action execution failed"
+                )
+
+            # -------- MARK SUCCESS ONLY IF ACTION SUCCEEDED --------
 
             cur.execute(
                 """
