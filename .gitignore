@@ -1,7 +1,19 @@
+# Node
+node_modules/
+**/node_modules/
+
+# Vite / React
+dist/
+.vite/
+
+# Environment variables
+.env
+.env.*
+
+# Python
 __pycache__/
 *.pyc
-.env
 
-.vscode/
-
+# OS junk
 .DS_Store
+
