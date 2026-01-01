@@ -1,11 +1,15 @@
 import json
 import uuid
 import psycopg
+from datetime import datetime
+from typing import List, Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
-from datetime import datetime
+
+from action_executor import execute_action
+
 
 # -------------------------------------------------------------------
 # Database Configuration
@@ -23,7 +27,7 @@ DB_CONFIG = {
 # App Initialization
 # -------------------------------------------------------------------
 
-app = FastAPI(title="Workflow Approval API")
+app = FastAPI(title="Enterprise AI Workflow API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,7 +68,7 @@ class WorkflowEventResponse(BaseModel):
 
 
 # -------------------------------------------------------------------
-# Utility Functions
+# Event Logger
 # -------------------------------------------------------------------
 
 def log_event(
@@ -72,9 +76,6 @@ def log_event(
     event_type: str,
     event_data: dict | None = None
 ):
-    """
-    Writes a workflow event to the event log.
-    """
     with psycopg.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -86,7 +87,6 @@ def log_event(
             )
         conn.commit()
 
-
 # -------------------------------------------------------------------
 # Health Check
 # -------------------------------------------------------------------
@@ -95,30 +95,27 @@ def log_event(
 def root():
     return {"status": "Workflow API running"}
 
-
 # -------------------------------------------------------------------
-# Create Workflow Endpoint
+# Create Workflow
 # -------------------------------------------------------------------
 
 @app.post("/workflows")
 def create_workflow(request: CreateWorkflowRequest):
+
     if not request.text or not request.text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Request text cannot be empty"
-        )
+        raise HTTPException(status_code=400, detail="Request text cannot be empty")
 
     workflow_id = str(uuid.uuid4())
+    request_text = request.text.strip()
 
     with psycopg.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
-
             cur.execute(
                 """
                 INSERT INTO workflows (id, request_text, state)
                 VALUES (%s, %s, 'RECEIVED');
                 """,
-                (workflow_id, request.text.strip())
+                (workflow_id, request_text)
             )
 
             cur.execute(
@@ -132,12 +129,11 @@ def create_workflow(request: CreateWorkflowRequest):
 
         conn.commit()
 
-    log_event(workflow_id, "CREATED", {"request_text": request.text.strip()})
-    log_event(
-        workflow_id,
-        "STATE_TRANSITION",
-        {"from": "RECEIVED", "to": "AI_ANALYZED"}
-    )
+    log_event(workflow_id, "CREATED", {"request_text": request_text})
+    log_event(workflow_id, "STATE_TRANSITION", {
+        "from": "RECEIVED",
+        "to": "AI_ANALYZED"
+    })
 
     return {
         "workflow_id": workflow_id,
@@ -145,9 +141,8 @@ def create_workflow(request: CreateWorkflowRequest):
         "message": "Workflow created and queued for AI analysis"
     }
 
-
 # -------------------------------------------------------------------
-# Approval Endpoint (STEP 2 VERSION)
+# Approval Endpoint (Human-in-the-loop)
 # -------------------------------------------------------------------
 
 @app.post("/workflows/{workflow_id}/approve")
@@ -164,7 +159,7 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
 
             cur.execute(
                 """
-                SELECT state, ai_output
+                SELECT state, ai_output, request_text
                 FROM workflows
                 WHERE id = %s;
                 """,
@@ -175,7 +170,7 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
             if not row:
                 raise HTTPException(status_code=404, detail="Workflow not found")
 
-            state, ai_output = row
+            state, ai_output, request_text = row
 
             if state != "WAITING_FOR_APPROVAL":
                 raise HTTPException(
@@ -190,10 +185,16 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
                 "decided_at": datetime.utcnow().isoformat()
             }
 
-            # -------------------------------
-            # Rejected
-            # -------------------------------
+            # -------------------- REJECTED --------------------
+
             if approval.decision == "rejected":
+
+                log_event(
+                    workflow_id,
+                    "ACTION_REJECTED",
+                    human_decision
+                )
+
                 cur.execute(
                     """
                     UPDATE workflows
@@ -204,20 +205,12 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
                     """,
                     (json.dumps(human_decision), workflow_id)
                 )
-
                 conn.commit()
-
-                log_event(
-                    workflow_id,
-                    "REJECTED",
-                    {"reviewer": approval.reviewer}
-                )
 
                 return {"status": "rejected", "workflow_id": workflow_id}
 
-            # -------------------------------
-            # Approved (NO execution here)
-            # -------------------------------
+            # -------------------- APPROVED --------------------
+
             if not ai_output or "recommended_action" not in ai_output:
                 raise HTTPException(
                     status_code=500,
@@ -226,45 +219,48 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
 
             recommended_action = ai_output["recommended_action"]
 
+            log_event(
+                workflow_id,
+                "ACTION_APPROVED",
+                {
+                    "action": recommended_action,
+                    "reviewer": approval.reviewer
+                }
+            )
+
+            # Execute real-world side effect (idempotent)
+            execute_action(
+                action=recommended_action,
+                workflow_id=workflow_id,
+                request_text=request_text
+            )
+
             cur.execute(
                 """
                 UPDATE workflows
-                SET
-                    state = 'ACTION_APPROVED',
-                    action_type = %s,
-                    action_status = 'PENDING',
+                SET state = 'ACTION_EXECUTED',
                     human_decision = %s,
                     updated_at = NOW()
                 WHERE id = %s;
                 """,
-                (
-                    recommended_action,
-                    json.dumps(human_decision),
-                    workflow_id,
-                )
+                (json.dumps(human_decision), workflow_id)
             )
 
         conn.commit()
 
-    log_event(
-        workflow_id,
-        "ACTION_APPROVED",
-        {"action_type": recommended_action}
-    )
-
     return {
         "status": "approved",
-        "action_type": recommended_action,
+        "action_executed": recommended_action,
         "workflow_id": workflow_id
     }
 
-
 # -------------------------------------------------------------------
-# Read APIs
+# Read APIs (UI)
 # -------------------------------------------------------------------
 
 @app.get("/workflows", response_model=List[WorkflowResponse])
 def list_workflows():
+
     with psycopg.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -299,6 +295,7 @@ def list_workflows():
 
 @app.get("/workflows/{workflow_id}", response_model=WorkflowResponse)
 def get_workflow(workflow_id: str):
+
     with psycopg.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
             cur.execute(

@@ -1,12 +1,11 @@
 import os
 import json
-import time
 import psycopg
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
 # -------------------------------------------------------------------
-# Configuration
+# Database Configuration
 # -------------------------------------------------------------------
 
 DB_CONFIG = {
@@ -14,18 +13,28 @@ DB_CONFIG = {
     "port": 5432,
     "dbname": "ai_workflows",
     "user": "postgres",
-    "password": "postgres",
+    "password": "postgres",  # local dev only
 }
 
+# -------------------------------------------------------------------
+# SendGrid Configuration
+# -------------------------------------------------------------------
+
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL")
+TO_EMAIL = os.getenv("DEFAULT_EMAIL_TO")
 
-FROM_EMAIL = "no-reply@yourcompany.com"
-DEFAULT_TO_EMAIL = "sales@yourcompany.com"
+if not SENDGRID_API_KEY:
+    raise RuntimeError("SENDGRID_API_KEY is not set")
 
-POLL_INTERVAL_SECONDS = 3
+if not FROM_EMAIL:
+    raise RuntimeError("SENDGRID_FROM_EMAIL is not set")
+
+if not TO_EMAIL:
+    raise RuntimeError("DEFAULT_EMAIL_TO is not set")
 
 # -------------------------------------------------------------------
-# Utilities
+# Event Helpers
 # -------------------------------------------------------------------
 
 def log_event(workflow_id: str, event_type: str, event_data: dict | None = None):
@@ -36,160 +45,105 @@ def log_event(workflow_id: str, event_type: str, event_data: dict | None = None)
                 INSERT INTO workflow_events (workflow_id, event_type, event_data)
                 VALUES (%s, %s, %s);
                 """,
-                (workflow_id, event_type, json.dumps(event_data)),
+                (workflow_id, event_type, json.dumps(event_data))
             )
         conn.commit()
 
 
+def email_already_sent(workflow_id: str) -> bool:
+    with psycopg.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM workflow_events
+                WHERE workflow_id = %s
+                  AND event_type = 'EMAIL_SENT'
+                LIMIT 1;
+                """,
+                (workflow_id,)
+            )
+            return cur.fetchone() is not None
+
 # -------------------------------------------------------------------
-# Action Implementations
+# Email Execution (Idempotent)
 # -------------------------------------------------------------------
 
-def send_email(workflow_id: str, request_text: str):
-    if not SENDGRID_API_KEY:
-        raise RuntimeError("SENDGRID_API_KEY not set")
+def send_email_once(workflow_id: str, request_text: str):
+    if email_already_sent(workflow_id):
+        log_event(
+            workflow_id,
+            "EMAIL_SKIPPED_DUPLICATE",
+            {"reason": "Email already sent"}
+        )
+        print(f"[EMAIL] Skipped duplicate for workflow {workflow_id}")
+        return
+
+    subject = "Workflow Approved: Action Required"
+    body = f"""
+A workflow has been approved and requires action.
+
+Workflow ID:
+{workflow_id}
+
+Request:
+{request_text}
+""".strip()
 
     message = Mail(
         from_email=FROM_EMAIL,
-        to_emails=DEFAULT_TO_EMAIL,
-        subject=f"[Workflow] Action Required ({workflow_id[:8]})",
-        plain_text_content=request_text,
+        to_emails=TO_EMAIL,
+        subject=subject,
+        plain_text_content=body,
     )
 
-    sg = SendGridAPIClient(SENDGRID_API_KEY)
-    sg.send(message)
+    try:
+        sg = SendGridAPIClient(SENDGRID_API_KEY)
+        response = sg.send(message)
 
-    print(f"[EMAIL] Sent email for workflow {workflow_id}")
+        log_event(
+            workflow_id,
+            "EMAIL_SENT",
+            {
+                "to": TO_EMAIL,
+                "status_code": response.status_code
+            }
+        )
 
+        print(f"[EMAIL] Sent successfully for workflow {workflow_id}")
 
-def execute_action(action_type: str, workflow_id: str, request_text: str):
-    if action_type == "send_email":
-        send_email(workflow_id, request_text)
+    except Exception as e:
+        log_event(
+            workflow_id,
+            "EMAIL_FAILED",
+            {"error": str(e)}
+        )
+        print(f"[EMAIL] Failed for workflow {workflow_id}: {e}")
+        raise
+
+# -------------------------------------------------------------------
+# Public Action Executor
+# -------------------------------------------------------------------
+
+def execute_action(action: str, workflow_id: str, request_text: str):
+    if action == "send_email":
+        send_email_once(
+            workflow_id=workflow_id,
+            request_text=request_text
+        )
+
+    elif action == "create_task":
+        log_event(
+            workflow_id,
+            "TASK_CREATED",
+            {"note": "Task creation not implemented yet"}
+        )
+        print(f"[TASK] Created task for workflow {workflow_id}")
+
     else:
-        raise ValueError(f"Unsupported action_type: {action_type}")
-
-
-# -------------------------------------------------------------------
-# Core Executor Logic
-# -------------------------------------------------------------------
-
-def process_one_action() -> bool:
-    """
-    Processes exactly ONE pending action.
-    Returns True if an action was processed.
-    """
-
-    with psycopg.connect(**DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-
-            # Lock ONE workflow row safely
-            cur.execute(
-                """
-                SELECT id, action_type, request_text
-                FROM workflows
-                WHERE action_status = 'PENDING'
-                  AND state = 'ACTION_APPROVED'
-                ORDER BY updated_at
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1;
-                """
-            )
-
-            row = cur.fetchone()
-            if not row:
-                return False
-
-            workflow_id, action_type, request_text = row
-
-            print(f"\n[ACTION] Executing {action_type} for {workflow_id}")
-
-            # Mark as EXECUTING (idempotency lock)
-            cur.execute(
-                """
-                UPDATE workflows
-                SET action_status = 'EXECUTING',
-                    updated_at = NOW()
-                WHERE id = %s;
-                """,
-                (workflow_id,),
-            )
-            conn.commit()
-
-            try:
-                execute_action(action_type, workflow_id, request_text)
-
-                cur.execute(
-                    """
-                    UPDATE workflows
-                    SET action_status = 'COMPLETED',
-                        state = 'ACTION_EXECUTED',
-                        updated_at = NOW()
-                    WHERE id = %s;
-                    """,
-                    (workflow_id,),
-                )
-
-                log_event(
-                    workflow_id,
-                    "ACTION_EXECUTED",
-                    {"action": action_type},
-                )
-
-                conn.commit()
-
-                print(f"[SUCCESS] Action completed for {workflow_id}")
-                return True
-
-            except Exception as e:
-                conn.rollback()
-
-                cur.execute(
-                    """
-                    UPDATE workflows
-                    SET action_status = 'FAILED',
-                        state = 'ACTION_FAILED',
-                        updated_at = NOW()
-                    WHERE id = %s;
-                    """,
-                    (workflow_id,),
-                )
-
-                log_event(
-                    workflow_id,
-                    "ACTION_FAILED",
-                    {"error": str(e)},
-                )
-
-                conn.commit()
-
-                print(f"[ERROR] Action failed for {workflow_id}: {e}")
-                return True
-
-
-# -------------------------------------------------------------------
-# Runner Loop
-# -------------------------------------------------------------------
-
-def run_executor():
-    print("=" * 60)
-    print("ACTION EXECUTOR STARTED")
-    print("=" * 60)
-    print("Watching for approved workflows...\n")
-
-    while True:
-        try:
-            processed = process_one_action()
-            if not processed:
-                time.sleep(POLL_INTERVAL_SECONDS)
-
-        except KeyboardInterrupt:
-            print("\n[SHUTDOWN] Executor stopped")
-            break
-
-        except Exception as e:
-            print(f"[FATAL] Unexpected error: {e}")
-            time.sleep(10)
-
-
-if __name__ == "__main__":
-    run_executor()
+        log_event(
+            workflow_id,
+            "NO_ACTION",
+            {"reason": f"Unknown action: {action}"}
+        )
+        print(f"[ACTION] No action executed for workflow {workflow_id}")
