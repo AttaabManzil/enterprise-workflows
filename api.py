@@ -7,12 +7,13 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from openai import OpenAI
 
 from action_executor import execute_action
 
 
 # -------------------------------------------------------------------
-# Database Configuration
+# Configuration
 # -------------------------------------------------------------------
 
 DB_CONFIG = {
@@ -22,6 +23,9 @@ DB_CONFIG = {
     "user": "postgres",
     "password": "postgres",  # local dev only
 }
+
+client = OpenAI()
+
 
 # -------------------------------------------------------------------
 # App Initialization
@@ -36,6 +40,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # -------------------------------------------------------------------
 # Models
@@ -83,6 +88,49 @@ def log_event(workflow_id: str, event_type: str, event_data: dict | None = None)
             )
         conn.commit()
 
+
+# -------------------------------------------------------------------
+# AI Analyzer
+# -------------------------------------------------------------------
+
+def run_ai_analysis(request_text: str) -> dict:
+    """
+    Runs AI analysis and returns validated AI output.
+    Must return a dict with recommended_action.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You analyze business requests.\n"
+                    "Return ONLY valid JSON with this schema:\n"
+                    "{\n"
+                    '  "intent": string,\n'
+                    '  "recommended_action": "send_email" | "create_task" | "reject",\n'
+                    '  "confidence": number\n'
+                    "}"
+                )
+            },
+            {"role": "user", "content": request_text}
+        ],
+    )
+
+    content = response.choices[0].message.content
+
+    try:
+        ai_output = json.loads(content)
+    except json.JSONDecodeError:
+        raise ValueError("AI returned invalid JSON")
+
+    if "recommended_action" not in ai_output:
+        raise ValueError("Missing recommended_action")
+
+    return ai_output
+
+
 # -------------------------------------------------------------------
 # Health Check
 # -------------------------------------------------------------------
@@ -90,6 +138,7 @@ def log_event(workflow_id: str, event_type: str, event_data: dict | None = None)
 @app.get("/")
 def root():
     return {"status": "Workflow API running"}
+
 
 # -------------------------------------------------------------------
 # Create Workflow
@@ -104,6 +153,7 @@ def create_workflow(request: CreateWorkflowRequest):
     workflow_id = str(uuid.uuid4())
     request_text = request.text.strip()
 
+    # ---- CREATE WORKFLOW ----
     with psycopg.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -113,29 +163,49 @@ def create_workflow(request: CreateWorkflowRequest):
                 """,
                 (workflow_id, request_text)
             )
-
-            cur.execute(
-                """
-                UPDATE workflows
-                SET state = 'AI_ANALYZED', updated_at = NOW()
-                WHERE id = %s;
-                """,
-                (workflow_id,)
-            )
-
         conn.commit()
 
     log_event(workflow_id, "CREATED", {"request_text": request_text})
-    log_event(workflow_id, "STATE_TRANSITION", {
-        "from": "RECEIVED",
-        "to": "AI_ANALYZED"
-    })
+
+    # ---- RUN AI ANALYSIS ----
+    try:
+        ai_output = run_ai_analysis(request_text)
+    except Exception as e:
+        log_event(
+            workflow_id,
+            "AI_ANALYSIS_FAILED",
+            {"error": str(e)}
+        )
+        raise HTTPException(status_code=500, detail="AI analysis failed")
+
+    # ---- SAVE AI OUTPUT + TRANSITION ----
+    with psycopg.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE workflows
+                SET ai_output = %s,
+                    state = 'AI_ANALYZED',
+                    updated_at = NOW()
+                WHERE id = %s;
+                """,
+                (json.dumps(ai_output), workflow_id)
+            )
+        conn.commit()
+
+    log_event(workflow_id, "AI_OUTPUT_SAVED", ai_output)
+    log_event(
+        workflow_id,
+        "STATE_TRANSITION",
+        {"from": "RECEIVED", "to": "AI_ANALYZED"}
+    )
 
     return {
         "workflow_id": workflow_id,
         "state": "AI_ANALYZED",
-        "message": "Workflow created and queued for AI analysis"
+        "message": "Workflow created and analyzed"
     }
+
 
 # -------------------------------------------------------------------
 # Approval Endpoint (Human-in-the-loop)
@@ -181,8 +251,7 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
                 "decided_at": datetime.utcnow().isoformat()
             }
 
-            # -------------------- REJECTED --------------------
-
+            # -------- REJECTED --------
             if approval.decision == "rejected":
 
                 log_event(workflow_id, "ACTION_REJECTED", human_decision)
@@ -201,14 +270,7 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
 
                 return {"status": "rejected", "workflow_id": workflow_id}
 
-            # -------------------- APPROVED --------------------
-
-            if not ai_output or "recommended_action" not in ai_output:
-                raise HTTPException(
-                    status_code=500,
-                    detail="AI output missing recommended_action"
-                )
-
+            # -------- APPROVED --------
             recommended_action = ai_output["recommended_action"]
 
             log_event(
@@ -219,8 +281,6 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
                     "reviewer": approval.reviewer
                 }
             )
-
-            # -------- EXECUTE REAL-WORLD ACTION SAFELY --------
 
             try:
                 execute_action(
@@ -251,8 +311,7 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
                     detail="Action execution failed"
                 )
 
-            # -------- MARK SUCCESS ONLY IF ACTION SUCCEEDED --------
-
+            # -------- SUCCESS --------
             cur.execute(
                 """
                 UPDATE workflows
@@ -263,7 +322,6 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
                 """,
                 (json.dumps(human_decision), workflow_id)
             )
-
         conn.commit()
 
     return {
@@ -271,6 +329,7 @@ def approve_workflow(workflow_id: str, approval: ApprovalRequest):
         "action_executed": recommended_action,
         "workflow_id": workflow_id
     }
+
 
 # -------------------------------------------------------------------
 # Read APIs (UI)

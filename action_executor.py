@@ -4,6 +4,8 @@ import psycopg
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 
+from linear_client import create_issue
+
 # -------------------------------------------------------------------
 # Database Configuration
 # -------------------------------------------------------------------
@@ -34,10 +36,13 @@ if not TO_EMAIL:
     raise RuntimeError("DEFAULT_EMAIL_TO is not set")
 
 # -------------------------------------------------------------------
-# Event Helpers
+# Event Logger
 # -------------------------------------------------------------------
 
 def log_event(workflow_id: str, event_type: str, event_data: dict | None = None):
+    """
+    Writes an event to workflow_events table.
+    """
     with psycopg.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -49,6 +54,9 @@ def log_event(workflow_id: str, event_type: str, event_data: dict | None = None)
             )
         conn.commit()
 
+# -------------------------------------------------------------------
+# Idempotency Guards
+# -------------------------------------------------------------------
 
 def email_already_sent(workflow_id: str) -> bool:
     with psycopg.connect(**DB_CONFIG) as conn:
@@ -65,11 +73,31 @@ def email_already_sent(workflow_id: str) -> bool:
             )
             return cur.fetchone() is not None
 
+
+def task_already_created(workflow_id: str) -> bool:
+    with psycopg.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM workflow_events
+                WHERE workflow_id = %s
+                  AND event_type = 'TASK_CREATED'
+                LIMIT 1;
+                """,
+                (workflow_id,)
+            )
+            return cur.fetchone() is not None
+
 # -------------------------------------------------------------------
 # Email Execution (Idempotent)
 # -------------------------------------------------------------------
 
-def send_email_once(workflow_id: str, request_text: str):
+def send_email_once(workflow_id: str, content: str):
+    """
+    Sends an email exactly once per workflow.
+    """
+
     if email_already_sent(workflow_id):
         log_event(
             workflow_id,
@@ -79,22 +107,11 @@ def send_email_once(workflow_id: str, request_text: str):
         print(f"[EMAIL] Skipped duplicate for workflow {workflow_id}")
         return
 
-    subject = "Workflow Approved: Action Required"
-    body = f"""
-A workflow has been approved and requires action.
-
-Workflow ID:
-{workflow_id}
-
-Request:
-{request_text}
-""".strip()
-
     message = Mail(
         from_email=FROM_EMAIL,
         to_emails=TO_EMAIL,
-        subject=subject,
-        plain_text_content=body,
+        subject="Workflow Approved – Action Required",
+        plain_text_content=content,
     )
 
     try:
@@ -106,7 +123,7 @@ Request:
             "EMAIL_SENT",
             {
                 "to": TO_EMAIL,
-                "status_code": response.status_code
+                "status_code": response.status_code,
             }
         )
 
@@ -122,23 +139,71 @@ Request:
         raise
 
 # -------------------------------------------------------------------
-# Public Action Executor
+# Task Creation (Linear – Idempotent)
 # -------------------------------------------------------------------
 
-def execute_action(action: str, workflow_id: str, request_text: str):
-    if action == "send_email":
-        send_email_once(
-            workflow_id=workflow_id,
-            request_text=request_text
+def create_task_once(workflow_id: str, request_text: str):
+    """
+    Creates a Linear task exactly once per workflow.
+    """
+
+    if task_already_created(workflow_id):
+        log_event(
+            workflow_id,
+            "TASK_SKIPPED_DUPLICATE",
+            {"reason": "Task already created"}
+        )
+        print(f"[TASK] Skipped duplicate for workflow {workflow_id}")
+        return
+
+    try:
+        issue = create_issue(
+            title=f"Workflow Task {workflow_id[:8]}",
+            description=request_text or "Created from approved workflow",
         )
 
-    elif action == "create_task":
         log_event(
             workflow_id,
             "TASK_CREATED",
-            {"note": "Task creation not implemented yet"}
+            {
+                "linear_id": issue["id"],
+                "identifier": issue["identifier"],
+                "url": issue["url"],
+            }
         )
-        print(f"[TASK] Created task for workflow {workflow_id}")
+
+        print(f"[TASK] Created Linear issue {issue['identifier']}")
+
+    except Exception as e:
+        log_event(
+            workflow_id,
+            "TASK_FAILED",
+            {"error": str(e)}
+        )
+        print(f"[TASK] Failed for workflow {workflow_id}: {e}")
+        raise
+
+# -------------------------------------------------------------------
+# Public Action Executor
+# -------------------------------------------------------------------
+
+def execute_action(action: str, workflow_id: str, request_text: str | None = None):
+    """
+    Executes approved real-world actions.
+    This is the ONLY place side effects are allowed.
+    """
+
+    if action == "send_email":
+        send_email_once(
+            workflow_id=workflow_id,
+            content=request_text or "Approved workflow action"
+        )
+
+    elif action == "create_task":
+        create_task_once(
+            workflow_id=workflow_id,
+            request_text=request_text or "Created from approved workflow"
+        )
 
     else:
         log_event(
